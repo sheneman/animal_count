@@ -25,6 +25,7 @@ import torch
 import glob
 import numpy as np
 import imageio
+from ultralytics import YOLO
 from tqdm import tqdm	
 
 
@@ -32,14 +33,15 @@ DEFAULT_INPUT_DIR	= "inputs"
 DEFAULT_OUTPUT_DIR	= "outputs"
 DEFAULT_LOGGING_DIR 	= "logs"
 
-DEFAULT_MODEL            = 'md_v5a.0.0.pt'
+#DEFAULT_MODEL            = 'md_v5a.0.0.pt'
+DEFAULT_MODEL            = 'best_enlightengan_and_yolov8.pt'
 DEFAULT_INTERVAL         = 1.0   # number of seconds between samples
 DEFAULT_PADDING		 = 5.0   # number of seconds of video to include before first detection and after last detection in a clip
 DEFAULT_REPORT_FILENAME  = "report.csv"
 DEFAULT_NPROCS           = 4
 DEFAULT_NOBAR		 = False
+DEFAULT_YOLO_VERSION	 = 8   # either 5 or 8
 
-YOLODIR = "yolov5"
 
 
 parser = argparse.ArgumentParser(prog='tigervid', description='Analyze videos and extract clips and metadata which contain animals.')
@@ -53,6 +55,7 @@ parser.add_argument('-p', '--padding',  type=float, default=DEFAULT_PADDING,    
 parser.add_argument('-r', '--report',   type=str,   default=DEFAULT_REPORT_FILENAME, help='Name of report metadata (DEFAULT: '+DEFAULT_REPORT_FILENAME+')')
 parser.add_argument('-j', '--jobs',	type=int,   default=DEFAULT_NPROCS,          help='Number of concurrent (parallel) processes (DEFAULT: '+str(DEFAULT_NPROCS)+')')
 parser.add_argument('-l', '--logging',  type=str,   default=DEFAULT_LOGGING_DIR,     help='The directory for log files (DEFAULT: '+str(DEFAULT_LOGGING_DIR)+')')
+parser.add_argument('-y', '--yolo',     type=int,   default=DEFAULT_YOLO_VERSION,    help='The version of YOLO (5 or 8) (DEFAULT: '+str(DEFAULT_YOLO_VERSION)+')')
 
 parser.add_argument('-n', '--nobar',    action='store_true',  default=DEFAULT_NOBAR,     help='Turns off the Progress Bar during processing.  (DEFAULT: Use Progress Bar)')
 
@@ -64,8 +67,16 @@ args = parser.parse_args()
 
 
 
-
 args.cpu
+
+
+if(args.yolo == 5):
+	YOLODIR = "yolov5"
+elif(args.yolo == 8):
+	YOLODIR = "yolov8"
+else:
+	print("Error: YOLO version must be 5 or 8"
+	exit(-1)
 
 if(not os.path.isfile(args.model)):
 	print("Error:  Could not find model weights '%s'" %args.model, flush=True)
@@ -110,7 +121,9 @@ if __name__ != '__main__':
 		if(os.path.exists(YOLODIR)):
 			model = torch.hub.load(YOLODIR, 'custom', path=args.model, _verbose=False, verbose=False, source='local')
 		else:
-			model = torch.hub.load('ultralytics/yolov5', 'custom', path=args.model, _verbose=False, verbose=False)
+			#model = torch.hub.load('ultralytics/yolov8', 'custom', path=args.model, _verbose=False, verbose=False, trust_repo=True)
+			#model = torch.hub.load('ultralytics/yolov8', 'custom', path=args.model, _verbose=True, verbose=True, trust_repo=True)
+			model = YOLO(args.model)
 
 		model.to(device)
 	except:
@@ -233,17 +246,26 @@ def get_video_chunk(invid, model, interval_sz, pu_lock):
 	inference_frame = cv2.resize(image, (640,640))
 	with pu_lock:
 		try:
-			results = model(inference_frame).pandas().xyxy[0]
+			#results = model(inference_frame).pandas().xyxy[0]
+			results = model(inference_frame, verbose=False)[0]
+		    
 		except:
 			print("Error: Could not run model inference on frame from chunk index: %d" %chunk_idx)
 			sys.exit(-1)
 			#chunk_idx += 1
 			#return(None, False)
 
+	if(results.boxes is not None):
+		cls = results.boxes.cls.cpu().numpy()
+		conf  = results.boxes.conf.cpu().numpy()
+		if(len(cls)):
+			cls  = cls[0]
+			conf = conf[0]
+			#print(cls, conf)
 
-	if(results.shape[0]):
+	if(cls==0):
 		detection = True
-		confidence = results["confidence"].mean()
+		confidence = conf
 	else:
 		detection = False
 		confidence = None
@@ -678,8 +700,8 @@ def main():
 
 		time.sleep(0.5)  # Check periodically
 
-	clear_screen()
-	reset_screen()
+	#clear_screen()
+	#reset_screen()
 
 	print("Total time to process %d videos: %.02f seconds" %(len(files), time.time()-all_start_time))
 	print("Report file saved to %s" %args.report)
