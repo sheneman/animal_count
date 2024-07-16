@@ -4,7 +4,7 @@
 #
 # Luke Sheneman
 # sheneman@uidaho.edu
-# December 2023
+# July 2024
 #
 # Given a directory of videos, process each video to look for animals
 # Extracts video clips which include animals into destination directory
@@ -28,13 +28,21 @@ import imageio
 from ultralytics import YOLO
 from tqdm import tqdm	
 
+from transformers import AutoProcessor, AutoModelForCausalLM
+from PIL import Image
+import requests
+import copy
 
-DEFAULT_INPUT_DIR	= "inputs"
-DEFAULT_OUTPUT_DIR	= "outputs"
-DEFAULT_LOGGING_DIR 	= "logs"
 
-#DEFAULT_MODEL            = 'md_v5a.0.0.pt'
-DEFAULT_MODEL            = 'best_enlightengan_and_yolov8.pt'
+
+DEFAULT_INPUT_DIR	 = "inputs"
+DEFAULT_OUTPUT_DIR	 = "outputs"
+DEFAULT_LOGGING_DIR  	 = "logs"
+
+MEGADETECTOR_MODEL       = 'md_v5a.0.0.pt'
+TIGER_MODEL              = 'best_enlightengan_and_yolov8.pt'
+FLORENCE_MODEL           = 'microsoft/Florence-2-large'
+
 DEFAULT_INTERVAL         = 1.0   # number of seconds between samples
 DEFAULT_PADDING		 = 5.0   # number of seconds of video to include before first detection and after last detection in a clip
 DEFAULT_REPORT_FILENAME  = "report.csv"
@@ -49,13 +57,11 @@ parser = argparse.ArgumentParser(prog='tigervid', description='Analyze videos an
 parser.add_argument('input',  metavar='INPUT_DIR',  default=DEFAULT_INPUT_DIR,  help='Path to input directory containing MP4 videos')
 parser.add_argument('output', metavar='OUTPUT_DIR', default=DEFAULT_OUTPUT_DIR, help='Path to output directory for clips and metadatas')
 
-parser.add_argument('-m', '--model',	type=str,   default=DEFAULT_MODEL,           help='Path to the PyTorch model weights file (DEFAULT: '+DEFAULT_MODEL+')')
 parser.add_argument('-i', '--interval', type=float, default=DEFAULT_INTERVAL,        help='Number of seconds between AI sampling/detection (DEFAULT: '+str(DEFAULT_INTERVAL)+')')
 parser.add_argument('-p', '--padding',  type=float, default=DEFAULT_PADDING,         help='Number of seconds of video to pad on front and end of a clip (DEFAULT: '+str(DEFAULT_PADDING)+')')
 parser.add_argument('-r', '--report',   type=str,   default=DEFAULT_REPORT_FILENAME, help='Name of report metadata (DEFAULT: '+DEFAULT_REPORT_FILENAME+')')
 parser.add_argument('-j', '--jobs',	type=int,   default=DEFAULT_NPROCS,          help='Number of concurrent (parallel) processes (DEFAULT: '+str(DEFAULT_NPROCS)+')')
 parser.add_argument('-l', '--logging',  type=str,   default=DEFAULT_LOGGING_DIR,     help='The directory for log files (DEFAULT: '+str(DEFAULT_LOGGING_DIR)+')')
-parser.add_argument('-y', '--yolo',     type=int,   default=DEFAULT_YOLO_VERSION,    help='The version of YOLO (5 or 8) (DEFAULT: '+str(DEFAULT_YOLO_VERSION)+')')
 
 parser.add_argument('-n', '--nobar',    action='store_true',  default=DEFAULT_NOBAR,     help='Turns off the Progress Bar during processing.  (DEFAULT: Use Progress Bar)')
 
@@ -69,19 +75,6 @@ args = parser.parse_args()
 
 args.cpu
 
-
-if(args.yolo == 5):
-	YOLODIR = "yolov5"
-elif(args.yolo == 8):
-	YOLODIR = "yolov8"
-else:
-	print("Error: YOLO version must be 5 or 8"
-	exit(-1)
-
-if(not os.path.isfile(args.model)):
-	print("Error:  Could not find model weights '%s'" %args.model, flush=True)
-	parser.print_usage()
-	exit(-1)
 
 if(not os.path.exists(args.input)):
 	print("Error:  Could not find input directory path '%s'" %args.input, flush=True)
@@ -116,20 +109,31 @@ torch.device(device)
 
 if __name__ != '__main__':
 	logging.getLogger('torch.hub').setLevel(logging.ERROR)
-	    
+
 	try:
-		if(os.path.exists(YOLODIR)):
-			model = torch.hub.load(YOLODIR, 'custom', path=args.model, _verbose=False, verbose=False, source='local')
-		else:
-			#model = torch.hub.load('ultralytics/yolov8', 'custom', path=args.model, _verbose=False, verbose=False, trust_repo=True)
-			#model = torch.hub.load('ultralytics/yolov8', 'custom', path=args.model, _verbose=True, verbose=True, trust_repo=True)
-			model = YOLO(args.model)
+		print("Loading megadetector model...", flush=True)
+		megadetector_model = torch.hub.load('ultralytics/yolov5', 'custom', path=MEGADETECTOR_MODEL, _verbose=True, verbose=True, trust_repo=True)
 
-		model.to(device)
-	except:
-		print("COULD NOT DEPLOY MODEL TO DEVICE (GPU, etc.)")
+		print("Loading tiger model...", flush=True)
+		tiger_model        = YOLO(TIGER_MODEL)
+
+		print("Loading Florence-2 model...", flush=True)
+		florence_model     = AutoModelForCausalLM.from_pretrained(FLORENCE_MODEL, trust_remote_code=True).eval()
+		florence_processor = AutoProcessor.from_pretrained(FLORENCE_MODEL, trust_remote_code=True)
+
+		print("Models loaded...", flush=True)
+		
+		print("Depoying all models to device: ", device, flush=True)
+
+		megadetector_model.to(device)
+		tiger_model.to(device)
+		florence_model.to(device)
+
+		print("Models deployed on device: ", device,  flush=True)
+
+	except Exception as e:
+		print(f"Problem loading models and/or deploying to the GPU: {e}", flush=True)
 		sys.exit(-1)
-
 
 
 def report(pid, report_list):
@@ -215,6 +219,38 @@ def chunks(filenames, n):
 	return chunks
 
 
+def ensemble_detection(img):
+
+
+	# Megadetector Detection
+	megadetector_results = megadetector_model(img).pandas().xyxy[0]
+	megadetector_classes = megadetector_results['class'].tolist()
+	megadetector_results = 0 in megadetector_classes  # 0 = index of animal class for megadetector
+
+        # Tiger Detection
+	tiger_results = tiger_model(img)
+	if isinstance(tiger_results, list):
+		tiger_results = tiger_results[0]  # Assuming we take the first result if it's a list
+	tiger_results = any(int(box.cls) == 0 for box in tiger_results.boxes)
+
+	# Microsoft Florence-2 Detection
+	florence_image = Image.fromarray(img)
+	florence_results  = florence_task(florence_image, task_prompt="<OPEN_VOCABULARY_DETECTION>", text_input="tiger")
+	florence_polygons = florence_results['<OPEN_VOCABULARY_DETECTION>']['polygons']
+	if(len(florence_polygons)>0):
+		florence_results = True
+	else:
+		florence_results = False
+
+
+	print("Megadetector Results:")
+	print(megadetector_results)
+
+	print("Tiger Results:")
+	print(tiger_results)
+
+	print("Florence Results:")
+	print(florence_results)
 
 
 #
@@ -223,7 +259,7 @@ def chunks(filenames, n):
 #     result as dict with keys:  {frame_buffer, detection (boolean), confidence score}
 #     success (True/False) 
 #
-def get_video_chunk(invid, model, interval_sz, pu_lock):
+def get_video_chunk(invid, interval_sz, pu_lock):
 
 	global chunk_idx
 
@@ -243,31 +279,31 @@ def get_video_chunk(invid, model, interval_sz, pu_lock):
 			return(None, False)
 			
 
-	inference_frame = cv2.resize(image, (640,640))
+	inference_frame = cv2.resize(image, (640,640))    # is this needed?
 	with pu_lock:
+		results = ensemble_detection(inference_frame)
 		try:
-			#results = model(inference_frame).pandas().xyxy[0]
-			results = model(inference_frame, verbose=False)[0]
-		    
-		except:
+			results = ensemble_detection(inference_frame)
+
+		except Exception as e:
 			print("Error: Could not run model inference on frame from chunk index: %d" %chunk_idx)
+			print(f"Exception: {e}", flush=True)
 			sys.exit(-1)
-			#chunk_idx += 1
-			#return(None, False)
 
-	if(results.boxes is not None):
-		cls = results.boxes.cls.cpu().numpy()
-		conf  = results.boxes.conf.cpu().numpy()
-		if(len(cls)):
-			cls  = cls[0]
-			conf = conf[0]
-			#print(cls, conf)
+#	if(results.boxes is not None):
+#		cls = results.boxes.cls.cpu().numpy()
+#		conf  = results.boxes.conf.cpu().numpy()
+#		if(len(cls)):
+#			cls  = cls[0]
+#			conf = conf[0]
+#			#print(cls, conf)
 
-	if(cls==0):
-		detection = True
+	conf = 0.5	
+	if(results==True):
+		detection  = True
 		confidence = conf
 	else:
-		detection = False
+		detection  = False
 		confidence = None
     
 	#print("----> Detection is [%s] for chunk index: %d" %(str(detection), chunk_idx))
@@ -309,12 +345,47 @@ def get_debug_buffer(frame_chunk):
 	return(debug_info)
 
 
+#
+# call the Microsoft multi-modal CV Florence model
+#
+def florence_task(image, task_prompt, text_input=None):
+	if text_input is None:
+		prompt = task_prompt
+	else:
+		prompt = task_prompt + text_input
+
+	inputs = florence_processor(text=prompt, images=image, return_tensors="pt")
+    
+	# Move input tensors to the GPU
+	input_ids = inputs["input_ids"].to(device)
+	pixel_values = inputs["pixel_values"].to(device)
+    
+	generated_ids = florence_model.generate(
+		input_ids=input_ids,
+		pixel_values=pixel_values,
+		max_new_tokens=1024,
+		early_stopping=False,
+		do_sample=False,
+		num_beams=3,
+	)
+    
+	# Move generated_ids back to CPU before processing
+	generated_ids = generated_ids.to("cpu")
+    
+	generated_text = florence_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+	parsed_answer = florence_processor.post_process_generation(
+		generated_text,
+		task=task_prompt,
+		image_size=(image.width, image.height)
+	)
+
+	return parsed_answer
+
 
 
 def process_chunk(pid, chunk, pu_lock, report_lock):
 
 	global args
-	global model
 	global chunk_idx
 	global most_recent_written_chunk
 
@@ -383,7 +454,7 @@ def process_chunk(pid, chunk, pu_lock, report_lock):
 			pbar = tqdm(total=nframes,position=pid,ncols=100,unit=" frames",leave=False,mininterval=0.5,file=sys.stdout)
 			pbar.set_description("pid=%s Processing video %d/%d: %s" %(str(pid).zfill(2),fcnt+1,len(chunk),filename))
 
-		frame_chunk, success = get_video_chunk(invid, model, interval_frames, pu_lock)
+		frame_chunk, success = get_video_chunk(invid, interval_frames, pu_lock)
 		if(frame_chunk["detection"] == True):
 			confidences.append(frame_chunk["confidence"])
 		
@@ -445,7 +516,7 @@ def process_chunk(pid, chunk, pu_lock, report_lock):
 				forward_buf.append(frame_chunk)
 				forward_detection_flag = frame_chunk["detection"]
 				for i in range(0,2*padding_intervals+1):   #SHENEMAN
-					frame_chunk, success = get_video_chunk(invid, model, interval_frames, pu_lock)
+					frame_chunk, success = get_video_chunk(invid, interval_frames, pu_lock)
 					if(success and frame_chunk["detection"] == True):
 						confidences.append(frame_chunk["confidence"])
 					if(not args.nobar):
@@ -575,7 +646,7 @@ def process_chunk(pid, chunk, pu_lock, report_lock):
 					buffer_chunks.pop(0)
     
 		
-			frame_chunk, success = get_video_chunk(invid, model, interval_frames, pu_lock)
+			frame_chunk, success = get_video_chunk(invid, interval_frames, pu_lock)
 			if(success and frame_chunk["detection"] == True):
 				confidences.append(frame_chunk["confidence"])
 			if(not args.nobar):
@@ -647,7 +718,6 @@ def main():
 	print("*********************************************")
 	print("           INPUT_DIR: ", args.input)
 	print("          OUTPUT_DIR: ", args.output)
-	print("       MODEL WEIGHTS: ", args.model)
 	print("   SAMPLING INTERVAL: ", args.interval, "seconds")
 	print("    PADDING DURATION: ", args.padding, "seconds")
 	print("    CONCURRENT PROCS: ", args.jobs)
