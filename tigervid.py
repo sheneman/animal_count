@@ -12,8 +12,10 @@
 #
 ####################################################################
 
-
-import os, sys, time, pathlib
+import os
+import sys
+import time
+import pathlib
 import argparse
 from multiprocessing import Process, current_process, freeze_support, Lock, RLock, Manager
 import cv2
@@ -33,8 +35,6 @@ from PIL import Image
 import requests
 import copy
 
-
-
 DEFAULT_INPUT_DIR	 = "inputs"
 DEFAULT_OUTPUT_DIR	 = "outputs"
 DEFAULT_LOGGING_DIR  	 = "logs"
@@ -49,8 +49,6 @@ DEFAULT_REPORT_FILENAME  = "report.csv"
 DEFAULT_NPROCS           = 4
 DEFAULT_NOBAR		 = False
 DEFAULT_YOLO_VERSION	 = 8   # either 5 or 8
-
-
 
 parser = argparse.ArgumentParser(prog='tigervid', description='Analyze videos and extract clips and metadata which contain animals.')
 
@@ -71,108 +69,86 @@ group.add_argument('-c', '--cpu', action='store_true', default=False, help='Use 
 
 args = parser.parse_args()
 
-
-
-args.cpu
-
 os.environ['YOLO_VERBOSE'] = 'False'
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
-
-if(not os.path.exists(args.input)):
-	print("Error:  Could not find input directory path '%s'" %args.input, flush=True)
+if not os.path.exists(args.input):
+	print(f"Error:  Could not find input directory path '{args.input}'", flush=True)
 	parser.print_usage()
-	exit(-1)
+	sys.exit(-1)
 
-if(not os.path.exists(args.output)):
-	print("Could not find output directory path '%s'...Creating Directory!" %args.output, flush=True)
-	os.makedirs(args.outputs)
+if not os.path.exists(args.output):
+	print(f"Could not find output directory path '{args.output}'...Creating Directory!", flush=True)
+	os.makedirs(args.output)
 
-if(not os.path.exists(args.logging)):
-	print("Could not find logging directory path '%s'...Creating Directory!" %args.logging, flush=True)
+if not os.path.exists(args.logging):
+	print(f"Could not find logging directory path '{args.logging}'...Creating Directory!", flush=True)
 	os.makedirs(args.logging)
 
-if(args.cpu==True):
+if args.cpu:
 	device = "cpu"
-	torch.device(device)
-	if __name__ == '__main__':
-	    print("Using CPU", flush=True)
 	usegpu = False
 else:
-	if(torch.cuda.is_available()):
+	if torch.cuda.is_available():
 		device = "cuda"
 		usegpu = True
-		if __name__ == '__main__':
-		    print("Using GPU", flush=True)
 	else:
 		device = "cpu"
 		usegpu = False
 
 torch.device(device)
 
-if __name__ != '__main__':
-	logging.getLogger('torch.hub').setLevel(logging.ERROR)
+def load_models(pid):
+	print(f"PID={pid}: Loading Megadetector model...")
+	megadetector_model = torch.hub.load('ultralytics/yolov5', 'custom', path=MEGADETECTOR_MODEL, _verbose=False, verbose=False, trust_repo=True)
 
-	try:
-		print("Loading megadetector model...", flush=True)
-		megadetector_model = torch.hub.load('ultralytics/yolov5', 'custom', path=MEGADETECTOR_MODEL, _verbose=False, verbose=False, trust_repo=True)
+	print(f"PID={pid}: Loading EnlightenGAN Tiger model...")
+	tiger_model = YOLO(TIGER_MODEL)
 
-		print("Loading tiger model...", flush=True)
-		tiger_model        = YOLO(TIGER_MODEL)
+	print(f"PID={pid}: Loading Florence-2 model...")
+	florence_model = AutoModelForCausalLM.from_pretrained(FLORENCE_MODEL, trust_remote_code=True).eval()
+	florence_processor = AutoProcessor.from_pretrained(FLORENCE_MODEL, trust_remote_code=True)
 
-		print("Loading Florence-2 model...", flush=True)
-		florence_model     = AutoModelForCausalLM.from_pretrained(FLORENCE_MODEL, trust_remote_code=True).eval()
-		florence_processor = AutoProcessor.from_pretrained(FLORENCE_MODEL, trust_remote_code=True)
+	print(f"PID={pid}: All models loaded.")
 
-		print("Models loaded...", flush=True)
-		
-		print("Depoying all models to device: ", device, flush=True)
+	print(f"PID={pid}: Deploying all models to device: {device}")
 
-		megadetector_model.to(device)
-		tiger_model.to(device)
-		florence_model.to(device)
+	megadetector_model.to(device)
+	tiger_model.to(device)
+	florence_model.to(device)
 
-		print("Models deployed on device: ", device,  flush=True)
+	print(f"PID={pid}: Models deployed on device: {device}")
 
-	except Exception as e:
-		print(f"Problem loading models and/or deploying to the GPU: {e}", flush=True)
-		sys.exit(-1)
+	return megadetector_model, tiger_model, florence_model, florence_processor
+
 
 
 def report(pid, report_list):
+	filename, clip_path, fps, start_frame, end_frame, confidences = report_list
 
+	min_conf = min(confidences) if confidences else 0
+	max_conf = max(confidences) if confidences else 0
+	mean_conf = sum(confidences) / len(confidences) if confidences else 0
 
-	filename,clip_path,fps,start_frame,end_frame,confidences = report_list
-
-	min_conf  = min(confidences)
-	max_conf  = max(confidences)
-	mean_conf = 0 if len(confidences) == 0 else sum(confidences)/len(confidences)
-
-	s = "\"%s\", \"%s\", %d, %.02f, %d, %.02f, %d, %.02f, %.02f, %.02f, %.02f\n" %(filename, clip_path, start_frame, start_frame/fps, end_frame, end_frame/fps, end_frame-start_frame, (end_frame-start_frame)/fps, min_conf, max_conf, mean_conf)
+	s = f'"{filename}", "{clip_path}", {start_frame}, {start_frame/fps:.02f}, {end_frame}, {end_frame/fps:.02f}, {end_frame-start_frame}, {(end_frame-start_frame)/fps:.02f}, {min_conf:.02f}, {max_conf:.02f}, {mean_conf:.02f}\n'
 
 	try:
-		report_file = open(args.report, "a")
-		report_file.write(s)	
-		report_file.flush()
-		report_file.close()
+		with open(args.report, "a") as report_file:
+			report_file.write(s)
 	except:
-		print("Warning:  Could not open report file %s for writing in report()" %(args.report), flush=True)
-
-
-
+		print(f"Warning:  Could not open report file {args.report} for writing in report()", flush=True)
 
 def label(img, frame, fps):
-	s = "frame: %d, time: %s" %(frame, "{:0.3f}".format(frame/fps))
+	s = f"frame: {frame}, time: {frame/fps:.3f}"
 	cv2.putText(img, s, (200,100), cv2.FONT_HERSHEY_SIMPLEX, 1.75, (0,0,0), 6, cv2.LINE_AA) 	
 	cv2.putText(img, s, (200,100), cv2.FONT_HERSHEY_SIMPLEX, 1.75, (255,255,255), 3, cv2.LINE_AA) 	
-	return(img)
-
+	return img
 
 def clear_screen():
 	os.system('cls' if os.name == 'nt' else 'clear')
 
 def reset_screen():
-	if(os.name != 'nt'):
+	if os.name != 'nt':
 		os.system('reset')
 
 def human_size(bytes, units=[' bytes','KB','MB','GB','TB', 'PB', 'EB']):
@@ -182,77 +158,60 @@ def get_gpu_info():
 	nvidia_smi.nvmlInit()
 
 	deviceCount = nvidia_smi.nvmlDeviceGetCount()
-	gpu_info = []
-	gpu_info.append(deviceCount)
+	gpu_info = [deviceCount]
 	for i in range(deviceCount):
 		handle = nvidia_smi.nvmlDeviceGetHandleByIndex(i)
 		mem_info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
-
-		mem_free  = mem_info.free
-		mem_total = mem_info.total
-		mem_used  = mem_info.used
-
 		gpu_info.append((mem_info.total, mem_info.used, mem_info.free))
-
-		#print("Device {}: {}, Memory : ({:.2f}% free): {}(total), {} (free), {} (used)".format(i, nvidia_smi.nvmlDeviceGetName(handle), 100*mem_info.free/mem_info.total, human_size(mem_info.total), human_size(mem_info.free), human_size(mem_info.used)))
 
 	nvidia_smi.nvmlShutdown()
 
-	return(gpu_info)
-
-
+	return gpu_info
 
 def chunks(filenames, n):
 	if n <= 0:
 		return []
 
 	chunk_size = len(filenames) // n
-    
 	remainder = len(filenames) % n
-    
+	
 	chunks = []
 	start_index = 0
 
 	for i in range(n):
 		end_index = start_index + chunk_size + (1 if i < remainder else 0)
-		if(end_index > start_index):
+		if end_index > start_index:
 			chunks.append(filenames[start_index:end_index])
 		start_index = end_index
 
 	return chunks
 
-
 def contains_target_label(data):
 	target_labels = {"tiger", "tigers", "cat", "wildcat", "animal"}
 	labels = data.get("<OD>", {}).get("labels", [])
-	#print(labels)
 	return any(label in target_labels for label in labels)
 
-def ensemble_detection(img):
-
+def ensemble_detection(img, megadetector_model, tiger_model, florence_model, florence_processor):
 	# Megadetector Detection
 	megadetector_results = megadetector_model(img).pandas().xyxy[0]
 	megadetector_classes = megadetector_results['class'].tolist()
-	megadetector_confidences = megadetector_results['confidence'].tolist()  # Extract confidence values
-	megadetector_has_animal = 0 in megadetector_classes  # 0 = index of animal class for megadetector
+	megadetector_confidences = megadetector_results['confidence'].tolist()
+	megadetector_has_animal = 0 in megadetector_classes
 	megadetector_max_confidence = max(megadetector_confidences) if megadetector_confidences else 0
 
 	# Tiger Detection
 	tiger_results = tiger_model(img, verbose=False)
 	if isinstance(tiger_results, list):
-		tiger_results = tiger_results[0]  # Assuming we take the first result if it's a list
-	tiger_confidences = [box.conf.item() for box in tiger_results.boxes]  # Extract confidence values as floats
+		tiger_results = tiger_results[0]
+	tiger_confidences = [box.conf.item() for box in tiger_results.boxes]
 	tiger_has_tiger = any(int(box.cls) == 0 for box in tiger_results.boxes)
 	tiger_max_confidence = max(tiger_confidences) if tiger_confidences else 0
 
 	# Microsoft Florence-2 Detection
 	florence_image = Image.fromarray(img)
-	florence_results = florence_task(florence_image, task_prompt="<OD>")
-	labels = florence_results.get("<OD>", {}).get("labels", [])
+	florence_results = florence_task(florence_image, "OD>", florence_model, florence_processor)
 	florence_results = contains_target_label(florence_results)
 
-
-	# Aggregate results into a dictionary
 	results = {
 		"megadetector_detection": megadetector_has_animal,
 		"megadetector_conf": megadetector_max_confidence,
@@ -263,53 +222,26 @@ def ensemble_detection(img):
 
 	return results 
 
-
-
-#
-# retrieves chunk of video frames of size interval_sz
-# returns: 
-#     result as dict with keys:  {frame_buffer, detection (boolean), confidence score}
-#     success (True/False) 
-#
 def get_video_chunk(invid, interval_sz, pu_lock):
-
 	global chunk_idx
 
-	#print("Getting chunk: %d" %chunk_idx)
-
-
 	buf = []
-	for i in range(interval_sz):
+	for _ in range(interval_sz):
 		success, image = invid.read()
-		if(success):
+		if success:
 			buf.append(image)
 		else:
-			#print("Error:  Could not read frame chunk: %d" %chunk_idx)
 			chunk_idx += 1
-			return(None, False)
-			
+			return None, False
 
-	#inference_frame = cv2.resize(image, (640,640))    # is this needed?
 	inference_frame = image
 	with pu_lock:
 		try:
-		    results = ensemble_detection(inference_frame)
-
+			results = ensemble_detection(inference_frame, megadetector_model, tiger_model, florence_model, florence_processor)
 		except Exception as e:
-			print("Error: Could not run model inference on frame from chunk index: %d" %chunk_idx)
+			print(f"Error: Could not run model inference on frame from chunk index: {chunk_idx}")
 			print(f"Exception: {e}", flush=True)
 			sys.exit(-1)
-
-	#print(results)
-
-	if(results==True):
-		detection  = True
-		confidence = conf
-	else:
-		detection  = False
-		confidence = None
-    
-	#print("----> Detection is [%s] for chunk index: %d" %(str(detection), chunk_idx))
 
 	res = {
 		"chunk_idx": chunk_idx,
@@ -322,88 +254,51 @@ def get_video_chunk(invid, interval_sz, pu_lock):
 		"overall_detection": False,
 		"overall_confidence": 0
 	}
-    
-	# Number of models
+	
 	total_models = 3
-    
-	# List of detection and confidence results
 	detections = [
 		results.get("megadetector_detection"),
 		results.get("tiger_detection"),
 		results.get("florence_detection")
 	]
-    
+	
 	confidences = [
 		results.get("megadetector_conf", 0) if results.get("megadetector_detection") else 0,
 		results.get("tiger_conf", 0) if results.get("tiger_detection") else 0
 	]
-    
-	# Count the number of detections
-	detection_count = sum(detections)
-    
-	# Determine if the overall detection is successful (at least 2 models detected)
-	res["overall_detection"] = detection_count >= 2
-    
-	if res["overall_detection"]:
-		# Calculate the base confidence as the average of confidence scores from detecting models
-		if confidences:
-		    base_confidence = sum(confidences) / len(confidences)
-		else:
-		    base_confidence = 0
 	
-		# Adjust confidence based on models that did not detect
+	detection_count = sum(detections)
+	res["overall_detection"] = detection_count >= 2
+	
+	if res["overall_detection"]:
+		base_confidence = sum(confidences) / len(confidences) if confidences else 0
 		non_detection_count = total_models - detection_count
 		adjustment_factor = 1 - (non_detection_count / total_models)
-	
 		res["overall_confidence"] = base_confidence * adjustment_factor
 	else:
-		res["overall_confidence"] = 0  # No confidence if overall detection failed
+		res["overall_confidence"] = 0
 
-	chunk_idx+=1
-
-	return(res, True)
-
+	chunk_idx += 1
+	return res, True
 
 def write_clip(clip, frame_chunk):
-
 	global most_recent_written_chunk 
 
-
-	if(frame_chunk["chunk_idx"] <= most_recent_written_chunk):
-		print("***ALERT:  Trying to write the same chunk %d twice or out of order!!!  MOST RECENT CHUNK WRITTEN: %d" %(frame_chunk["chunk_idx"], most_recent_written_chunk))
+	if frame_chunk["chunk_idx"] <= most_recent_written_chunk:
+		print(f"***ALERT:  Trying to write the same chunk {frame_chunk['chunk_idx']} twice or out of order!!!  MOST RECENT CHUNK WRITTEN: {most_recent_written_chunk}")
 		return
-
-
-	#print("Writing: [%d, %s]" %(frame_chunk["chunk_idx"], str(frame_chunk["overall_detection"])))
 
 	most_recent_written_chunk = frame_chunk["chunk_idx"]
 	
 	for frame in frame_chunk["buffer"]:
 		clip.write(frame)
-		
-
 
 def get_debug_buffer(frame_chunk):
+	return " ".join(f"[{fc['chunk_idx']}|{fc['detection']}]" for fc in frame_chunk)
 
-	debug_info = ""
-	for fc in frame_chunk: 
-		debug_info += "[%d|%s] " %(fc["chunk_idx"],fc["detection"]) 
-
-	return(debug_info)
-
-
-#
-# call the Microsoft multi-modal CV Florence model
-#
-def florence_task(image, task_prompt, text_input=None):
-	if text_input is None:
-		prompt = task_prompt
-	else:
-		prompt = task_prompt + text_input
-
-	inputs = florence_processor(text=prompt, images=image, return_tensors="pt")
-    
-	# Move input tensors to the GPU
+def florence_task(image, task_prompt, florence_model, florence_processor):
+	inputs = florence_processor(text=task_prompt, images=image, return_tensors="pt")
+	
 	input_ids = inputs["input_ids"].to(device)
 	pixel_values = inputs["pixel_values"].to(device)
    
@@ -415,10 +310,9 @@ def florence_task(image, task_prompt, text_input=None):
 		do_sample=False,
 		num_beams=3,		
 	)
-    
-	# Move generated_ids back to CPU before processing
+	
 	generated_ids = generated_ids.to("cpu")
-    
+	
 	generated_text = florence_processor.batch_decode(generated_ids, verbose=False, skip_special_tokens=False)[0]
 	
 	parsed_answer = florence_processor.post_process_generation(
@@ -429,49 +323,47 @@ def florence_task(image, task_prompt, text_input=None):
 
 	return parsed_answer
 
+def process_chunks(pid, chunk, pu_lock, report_lock):
+	global megadetector_model, tiger_model, florence_model, florence_processor
+	global chunk_idx, most_recent_written_chunk
 
+	# Load models only once per process
+	megadetector_model, tiger_model, florence_model, florence_processor = load_models(pid)
 
-def process_chunk(pid, chunk, pu_lock, report_lock):
+	print("PID=", pid, " CHUNK=", chunk)
+	print("\n")
 
-	global args
-	global chunk_idx
-	global most_recent_written_chunk
-
-	# lets pace ourselves on startup to help avoid general race conditions
-	time.sleep(pid*1)
-
-	for fcnt, filename in enumerate(chunk):
-
-
+	for filename in chunk:
+		#print("Trying to read file: ", filename)
 		imageio_success = False
-		for x in range(10):
+		for _ in range(10):
 			try:
-				v=imageio.get_reader(filename,  'ffmpeg')
-				nframes  = v.count_frames()
+				v = imageio.get_reader(filename, 'ffmpeg')
+				nframes = v.count_frames()
 				metadata = v.get_meta_data()
 				v.close()
 
 				fps = metadata['fps']
 				duration = metadata['duration']
+
 				size = metadata['size']
 
 				imageio_success = True
-	
 				break
 			except:
-				print("pid=%s: WARNING: imageio timeout %s.   Trying again...." %(str(pid).zfill(2), filename), flush=True)
+				print(f"pid={str(pid).zfill(2)}: WARNING: imageio timeout {filename}.   Trying again....", flush=True)
 				time.sleep(1)
 
-		if(imageio_success == False):
-			print("pid=%s: WARNING: imageio could not read %s.  Skipping!" %(str(pid).zfill(2), filename), flush=True)
+		if not imageio_success:
+			print(f"pid={str(pid).zfill(2)}: WARNING: imageio could not read {filename}.  Skipping!", flush=True)
 			continue
 
-		(width,height) = size
+		width, height = size
 
 		try:
 			invid = cv2.VideoCapture(filename)
 		except:
-			print("pid=%s: Could not read video file: ", filename, " skipping..." %(str(pid).zfill(2)), flush=True)
+			print(f"pid={str(pid).zfill(2)}: Could not read video file: {filename}, skipping...", flush=True)
 			continue
 
 		DETECTION = 500
@@ -479,272 +371,152 @@ def process_chunk(pid, chunk, pu_lock, report_lock):
 
 		state = SCANNING
 
-		interval_frames	    = int(args.interval*fps)
-		padding_intervals   = math.ceil(args.padding*fps/interval_frames)
-		nchunks		    = math.ceil(nframes/interval_frames)
-		chunk_idx     = 0
-		clip_number   = 0
+		interval_frames = int(args.interval * fps)
+		padding_intervals = math.ceil(args.padding * fps / interval_frames)
+		nchunks = math.ceil(nframes / interval_frames)
+		chunk_idx = 0
+		clip_number = 0
 		buffer_chunks = []
-		forward_buf   = []
-		confidences   = []
+		forward_buf = []
+		confidences = []
 
 		most_recent_written_chunk = -1
-	
-		#print("NUMBER OF FRAMES: ", nframes)
-		#print("NUMBER OF CHUNKS: ", nchunks)
-		#print("FRAMES PER INTERVAL: ", interval_frames)	
-		#print("PADDING INTERVALS: ", padding_intervals)
 
-		#clear_screen()
-		if(args.nobar):
-			print("pid=%s Processing video %d/%d: %s" %(str(pid).zfill(2),fcnt+1,len(chunk),filename), flush=True)
+		if args.nobar:
+			print(f"pid={str(pid).zfill(2)} Processing video {chunk.index(filename)+1}/{len(chunk)}: {filename}", flush=True)
 		else:
-			pbar = tqdm(total=nframes,position=pid,ncols=100,unit=" frames",leave=False,mininterval=0.5,file=sys.stdout)
-			pbar.set_description("pid=%s Processing video %d/%d: %s" %(str(pid).zfill(2),fcnt+1,len(chunk),filename))
+			pbar = tqdm(total=nframes, position=pid, ncols=100, unit=" frames", leave=False, mininterval=0.5, file=sys.stdout)
+			pbar.set_description(f"pid={str(pid).zfill(2)} Processing video {chunk.index(filename)+1}/{len(chunk)}: {filename}")
 
 		frame_chunk, success = get_video_chunk(invid, interval_frames, pu_lock)
-		if(frame_chunk["overall_detection"] == True):
+		if frame_chunk["overall_detection"]:
 			confidences.append(frame_chunk["overall_confidence"])
 		
-		if(not args.nobar):	
+		if not args.nobar:    
 			pbar.update(interval_frames)
 
-		while(success):
-	
-			#print("CHUNK_IDX: %d/%d" %(chunk_idx, nchunks))
-			if(chunk_idx > nchunks):
-				#print("OUT OF CHUNKS TO READ.  BAILING")
-				return
+		while success:
+			if chunk_idx > nchunks:
+				break
 
-			# state transition from SCANNING blanks to DETECTION
-			if(state == SCANNING and frame_chunk["overall_detection"] == True):
-				#print("State transition from SCANNING blanks to DETECTION", flush=True)
+			# State transition from SCANNING blanks to DETECTION
+			if state == SCANNING and frame_chunk["overall_detection"]:
 				state = DETECTION
 
-				# some debugging of buffers
-				#debug_buffer = get_debug_buffer(buffer_chunks)
-				#print("   Primary buffer: ", debug_buffer)
-				#debug_buffer = get_debug_buffer(forward_buf)
-				#print("   Forward Buffer: ", debug_buffer)
-
-				# create a clip
 				fn = os.path.basename(filename)
-				clip_name = os.path.splitext(fn)[0] + "_{:03d}".format(clip_number) + ".mp4"
+				clip_name = f"{os.path.splitext(fn)[0]}_{clip_number:03d}.mp4"
 				clip_path = os.path.join(args.output, clip_name)
-				fourcc = cv2.VideoWriter_fourcc(*'mp4v')	
-				clip = cv2.VideoWriter(clip_path, fourcc, fps, (width,height))
+				fourcc = cv2.VideoWriter_fourcc(*'mp4v')    
+				clip = cv2.VideoWriter(clip_path, fourcc, fps, (width, height))
 				clip_number += 1
 			
-				# track the first frame of the clip for export to metadata report
-				if(len(buffer_chunks)>0):
-					clip_start_frame = buffer_chunks[0]["chunk_idx"]*interval_frames
-				else:
-					clip_start_frame = 0
-				# flush the current sliding window buffer to the new clip
+				clip_start_frame = buffer_chunks[0]["chunk_idx"] * interval_frames if buffer_chunks else 0
 				for fc in buffer_chunks:
 					write_clip(clip, fc)
 				buffer_chunks = []
 				write_clip(clip, frame_chunk)
 
-			# possible state transition from DETECTION back to SCANNING
-			elif(state == DETECTION and frame_chunk["overall_detection"] == False):
-    
-				#print("state  == DETECTION, detection == False", flush=True)
-				#
-				# some debugging of buffers
-				#debug_buffer = get_debug_buffer(buffer_chunks)
-				#print("   Primary buffer: ", debug_buffer)
-				#debug_buffer = get_debug_buffer(forward_buf)
-				#print("   Forward Buffer: ", debug_buffer)
-				#
-				#print("grabbing forward_buffer...")
-    
-				# lets look into the future 2X to make sure we can split the clip
-				forward_buf = []
-				forward_buf.append(frame_chunk)
+			# Possible state transition from DETECTION back to SCANNING
+			elif state == DETECTION and not frame_chunk["overall_detection"]:
+				forward_buf = [frame_chunk]
 				forward_detection_flag = frame_chunk["overall_detection"]
-				for i in range(0,2*padding_intervals+1):   #SHENEMAN
+				for _ in range(2 * padding_intervals + 1):
 					frame_chunk, success = get_video_chunk(invid, interval_frames, pu_lock)
-					if(success and frame_chunk["overall_detection"] == True):
+					if success and frame_chunk["overall_detection"]:
 						confidences.append(frame_chunk["overall_confidence"])
-					if(not args.nobar):
+					if not args.nobar:
 						pbar.update(interval_frames)
-					if(success and frame_chunk["chunk_idx"]<=nchunks):
+					if success and frame_chunk["chunk_idx"] <= nchunks:
 						forward_buf.append(frame_chunk)
-						if(frame_chunk["overall_detection"]):
+						if frame_chunk["overall_detection"]:
 							forward_detection_flag = True
-				#	else:
-				#		print("ELSE: success and frame_chunk[0]<=nchunks")
-					
 
-				if(forward_detection_flag == False):   # no positive detections in forward buffer
-					#print("   NO positive detections in the forward buffer.", flush=True)
-   
-					# some debugging of buffers
-					#debug_buffer = get_debug_buffer(buffer_chunks)
-					#print("   Primary buffer: ", debug_buffer)
-					#debug_buffer = get_debug_buffer(forward_buf)
-					#print("   Forward Buffer: ", debug_buffer)
-
-					#print("  Flushing primary buffer", flush=True)
+				if not forward_detection_flag:
 					for f in buffer_chunks:
 						write_clip(clip, f)
 					buffer_chunks = []
 
-					# flush the first part of the forward buffer disk up to padding_intervals
-					if(len(forward_buf)>padding_intervals):
-						extent = padding_intervals
-					else:
-						extent = len(forward_buf)	
-
+					extent = min(padding_intervals, len(forward_buf))
 					for i in range(extent):
-						frame_chunk = forward_buf.pop(0)		
-						write_clip(clip, frame_chunk)	
+						frame_chunk = forward_buf.pop(0)        
+						write_clip(clip, frame_chunk)    
 
-					# put whatever is left of the forward buffer onto the end of primary buffer
 					buffer_chunks += forward_buf
 					forward_buf = []
 
-					## WRITE CLIP TO DISK AND LOG
-					clip.release()	
+					clip.release()    
 					clip_end_frame = (most_recent_written_chunk * interval_frames) + interval_frames
 					with report_lock:
 						report(pid, [filename, clip_path, fps, clip_start_frame, clip_end_frame, confidences])
-					#print("***WROTE CLIP TO DISK***")
 
-					# some debugging of buffers
-					#debug_buffer = get_debug_buffer(buffer_chunks)
-					#print("   Primary buffer: ", debug_buffer)
-					#debug_buffer = get_debug_buffer(forward_buf)
-					#print("   Forward Buffer: ", debug_buffer)
-					#
-					#print("Changing state back to SCANNING...", flush=True)
-					state = SCANNING     # complete state transition back to SCANNING
+					state = SCANNING
 
-				else:   # positive detection in the forward buffer
-    
-					#print("  Positive detections in the forward buffer.", flush=True)
-
-					# some debugging of buffers
-					#debug_buffer = get_debug_buffer(buffer_chunks)
-					#print("   Primary buffer: ", debug_buffer)
-					#debug_buffer = get_debug_buffer(forward_buf)
-					#print("   Forward Buffer: ", debug_buffer)
-                                        #
-					#print("  Flushing buffer", flush=True)
+				else:
 					for f in buffer_chunks:
 						write_clip(clip, f)
 					buffer_chunks = []
 
-					#write_clip(clip, frame_chunk)
+					last_forward_detection_idx = max(i for i, f in enumerate(forward_buf) if f["overall_detection"])
 
-					last_forward_detection_idx = -1
-
-					for i,f in enumerate(forward_buf):
-						if(f["detection"]):
-							last_forward_detection_idx = i
-
-					#print("  Flushing all chunks in forward buffer up to and including the last_forward_detection_idx: ", last_forward_detection_idx)
-
-					# some debugging of buffers
-					#debug_buffer = get_debug_buffer(buffer_chunks)
-					#print("   Primary buffer: ", debug_buffer)
-					#debug_buffer = get_debug_buffer(forward_buf)
-					#print("   Forward Buffer: ", debug_buffer)
-
-
-					for i in range(last_forward_detection_idx+1):
+					for i in range(last_forward_detection_idx + 1):
 						write_clip(clip, forward_buf[i])
-   
-					if(last_forward_detection_idx < len(forward_buf)-1): 
-						forward_buf = forward_buf[last_forward_detection_idx+1:]
+
+					if last_forward_detection_idx < len(forward_buf) - 1: 
+						forward_buf = forward_buf[last_forward_detection_idx + 1:]
 					else:
 						forward_buf = []
-				
-					buffer_chunks = forward_buf	    
+			
+					buffer_chunks = forward_buf        
 					forward_buf = []
 
-					# some debugging of buffers
-					#debug_buffer = get_debug_buffer(buffer_chunks)
-					#print("   Primary buffer: ", debug_buffer)
-					#debug_buffer = get_debug_buffer(forward_buf)
-					#print("   Forward Buffer: ", debug_buffer)
-                                        #
-					#print("\n")
-
-
-			elif(state == DETECTION and frame_chunk["overall_detection"] == True):
-
-				if(len(buffer_chunks)>0):
-					#print("Flushing Primary Buffer...")		    
+			elif state == DETECTION and frame_chunk["overall_detection"]:
+				if buffer_chunks:
 					for ch in buffer_chunks:
 						write_clip(clip, ch)
 					buffer_chunks = []
 
-				#print("state == DETECTION, and detection == TRUE", flush=True)
 				write_clip(clip, frame_chunk)
-	
-			else:   # state == SCANNING, frame_chunk["overall_detection"] == FALSE
-				#print("state == SCANNING, detection == FALSE.  Continuing to see nothing....", flush=True) 
 
-				# add this new chunk to the sliding window
-				#print("Adding new chunk to sliding window...", flush=True)
+			else:  # state == SCANNING, frame_chunk["overall_detection"] == FALSE
 				buffer_chunks.append(frame_chunk)
-				if(len(buffer_chunks)>padding_intervals):
+				if len(buffer_chunks) > padding_intervals:
 					buffer_chunks.pop(0)
-    
-		
+	
 			frame_chunk, success = get_video_chunk(invid, interval_frames, pu_lock)
-			if(success and frame_chunk["overall_detection"] == True):
+			if success and frame_chunk["overall_detection"]:
 				confidences.append(frame_chunk["overall_confidence"])
-			if(not args.nobar):
+			if not args.nobar:
 				pbar.update(interval_frames)
-
 
 		try:
 			clip.release()
 			clip_end_frame = (most_recent_written_chunk * interval_frames) + interval_frames
-			#with report_lock:
-			#	report(pid, [filename, clip_path, fps, clip_start_frame, clip_end_frame, confidences])
 		except:
-			None
-			 
+			pass
+		 
 		invid.release()
 
-	if(not args.nobar):
+	if not args.nobar:
 		pbar.close()
-	#clear_screen()
 
-
-
-########################################
-#
-# Main Execution Section
-#
-#
 def main():
-
 	all_start_time = time.time()
 
-	if(usegpu == True):
+	if usegpu:
 		gpu_info = get_gpu_info()
-		print("Detected %d CUDA GPUs" %(gpu_info[0]))
-		for g in range(1,len(gpu_info)):
+		print(f"Detected {gpu_info[0]} CUDA GPUs")
+		for g in range(1, len(gpu_info)):
 			mem_total, mem_used, mem_free = gpu_info[g]
-			print("GPU:{}, Memory : ({:.2f}% free): {}(total), {} (free), {} (used)".format(g-1, 100*mem_free/mem_total, human_size(mem_total), human_size(mem_free), human_size(mem_used)))
+			print(f"GPU:{g-1}, Memory : ({100*mem_free/mem_total:.2f}% free): {human_size(mem_total)}(total), {human_size(mem_free)} (free), {human_size(mem_used)} (used)")
 
 	freeze_support()  # For Windows support - multiprocessing with tqdm
 
 	try:
-		report_file = open(args.report, "w")
+		with open(args.report, "w") as report_file:
+			report_file.write("ORIGINAL, CLIP, START_FRAME, START_TIME, END_FRAME, END_TIME, NUM FRAMES, DURATION, MIN_CONF, MAX_CONF, MEAN_CONF\n")
 	except:
-		print("Error: Could not open report file %s in main()" %(args.report), flush=True)
-		exit(-1)
-
-	report_file.write("ORIGINAL, CLIP, START_FRAME, START_TIME, END_FRAME, END_TIME, NUM FRAMES, DURATION, MIN_CONF, MAX_CONF, MEAN_CONF\n")
-	report_file.flush()
-	report_file.close()
-
+		print(f"Error: Could not open report file {args.report} in main()", flush=True)
+		sys.exit(-1)
 
 	print('''
 	****************************************************
@@ -777,22 +549,21 @@ def main():
 	path = os.path.join(args.input, "*.mp4")
 	files = glob.glob(path)
 	random.shuffle(files)
-	ch = chunks(files,args.jobs)
+	ch = chunks(files, args.jobs)
 
 	manager = Manager()
 
-	pu_lock     = manager.Lock()
+	pu_lock = manager.Lock()
 	report_lock = manager.Lock()
 
-	if(usegpu==True):
+	if usegpu:
 		torch.cuda.empty_cache()
 
 	processes = []
-	for pid,chunk in enumerate(ch):
-		p = Process(target = process_chunk, args=(pid, chunk, pu_lock, report_lock))
+	for pid, chunk in enumerate(ch):
+		p = Process(target=process_chunks, args=(pid, chunk, pu_lock, report_lock))
 		processes.append(p)
 		p.start()
-
 
 	while any(p.is_alive() for p in processes):
 		for p in processes:
@@ -818,17 +589,10 @@ def main():
 
 		time.sleep(0.5)  # Check periodically
 
-	#clear_screen()
-	#reset_screen()
-
-	print("Total time to process %d videos: %.02f seconds" %(len(files), time.time()-all_start_time))
-	print("Report file saved to %s" %args.report)
+	print(f"Total time to process {len(files)} videos: {time.time()-all_start_time:.02f} seconds")
+	print(f"Report file saved to {args.report}")
 	print("\nDONE\n")
 
-
 if __name__ == '__main__':
-
 	torch.multiprocessing.set_start_method('spawn')
-
 	main()
-
