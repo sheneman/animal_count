@@ -75,6 +75,9 @@ args = parser.parse_args()
 
 args.cpu
 
+os.environ['YOLO_VERBOSE'] = 'False'
+os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+
 
 if(not os.path.exists(args.input)):
 	print("Error:  Could not find input directory path '%s'" %args.input, flush=True)
@@ -112,7 +115,7 @@ if __name__ != '__main__':
 
 	try:
 		print("Loading megadetector model...", flush=True)
-		megadetector_model = torch.hub.load('ultralytics/yolov5', 'custom', path=MEGADETECTOR_MODEL, _verbose=True, verbose=True, trust_repo=True)
+		megadetector_model = torch.hub.load('ultralytics/yolov5', 'custom', path=MEGADETECTOR_MODEL, _verbose=False, verbose=False, trust_repo=True)
 
 		print("Loading tiger model...", flush=True)
 		tiger_model        = YOLO(TIGER_MODEL)
@@ -219,38 +222,47 @@ def chunks(filenames, n):
 	return chunks
 
 
-def ensemble_detection(img):
+def contains_target_label(data):
+	target_labels = {"tiger", "tigers", "cat", "wildcat", "animal"}
+	labels = data.get("<OD>", {}).get("labels", [])
+	#print(labels)
+	return any(label in target_labels for label in labels)
 
+def ensemble_detection(img):
 
 	# Megadetector Detection
 	megadetector_results = megadetector_model(img).pandas().xyxy[0]
 	megadetector_classes = megadetector_results['class'].tolist()
-	megadetector_results = 0 in megadetector_classes  # 0 = index of animal class for megadetector
+	megadetector_confidences = megadetector_results['confidence'].tolist()  # Extract confidence values
+	megadetector_has_animal = 0 in megadetector_classes  # 0 = index of animal class for megadetector
+	megadetector_max_confidence = max(megadetector_confidences) if megadetector_confidences else 0
 
-        # Tiger Detection
-	tiger_results = tiger_model(img)
+	# Tiger Detection
+	tiger_results = tiger_model(img, verbose=False)
 	if isinstance(tiger_results, list):
 		tiger_results = tiger_results[0]  # Assuming we take the first result if it's a list
-	tiger_results = any(int(box.cls) == 0 for box in tiger_results.boxes)
+	tiger_confidences = [box.conf.item() for box in tiger_results.boxes]  # Extract confidence values as floats
+	tiger_has_tiger = any(int(box.cls) == 0 for box in tiger_results.boxes)
+	tiger_max_confidence = max(tiger_confidences) if tiger_confidences else 0
 
 	# Microsoft Florence-2 Detection
 	florence_image = Image.fromarray(img)
-	florence_results  = florence_task(florence_image, task_prompt="<OPEN_VOCABULARY_DETECTION>", text_input="tiger")
-	florence_polygons = florence_results['<OPEN_VOCABULARY_DETECTION>']['polygons']
-	if(len(florence_polygons)>0):
-		florence_results = True
-	else:
-		florence_results = False
+	florence_results = florence_task(florence_image, task_prompt="<OD>")
+	labels = florence_results.get("<OD>", {}).get("labels", [])
+	florence_results = contains_target_label(florence_results)
 
 
-	print("Megadetector Results:")
-	print(megadetector_results)
+	# Aggregate results into a dictionary
+	results = {
+		"megadetector_detection": megadetector_has_animal,
+		"megadetector_conf": megadetector_max_confidence,
+		"tiger_detection": tiger_has_tiger,
+		"tiger_confidence": tiger_max_confidence,
+		"florence_detection": florence_results
+	}
 
-	print("Tiger Results:")
-	print(tiger_results)
+	return results 
 
-	print("Florence Results:")
-	print(florence_results)
 
 
 #
@@ -265,8 +277,6 @@ def get_video_chunk(invid, interval_sz, pu_lock):
 
 	#print("Getting chunk: %d" %chunk_idx)
 
-	res = {}
-	res["chunk_idx"] = chunk_idx
 
 	buf = []
 	for i in range(interval_sz):
@@ -279,26 +289,19 @@ def get_video_chunk(invid, interval_sz, pu_lock):
 			return(None, False)
 			
 
-	inference_frame = cv2.resize(image, (640,640))    # is this needed?
+	#inference_frame = cv2.resize(image, (640,640))    # is this needed?
+	inference_frame = image
 	with pu_lock:
-		results = ensemble_detection(inference_frame)
 		try:
-			results = ensemble_detection(inference_frame)
+		    results = ensemble_detection(inference_frame)
 
 		except Exception as e:
 			print("Error: Could not run model inference on frame from chunk index: %d" %chunk_idx)
 			print(f"Exception: {e}", flush=True)
 			sys.exit(-1)
 
-#	if(results.boxes is not None):
-#		cls = results.boxes.cls.cpu().numpy()
-#		conf  = results.boxes.conf.cpu().numpy()
-#		if(len(cls)):
-#			cls  = cls[0]
-#			conf = conf[0]
-#			#print(cls, conf)
+	#print(results)
 
-	conf = 0.5	
 	if(results==True):
 		detection  = True
 		confidence = conf
@@ -308,9 +311,53 @@ def get_video_chunk(invid, interval_sz, pu_lock):
     
 	#print("----> Detection is [%s] for chunk index: %d" %(str(detection), chunk_idx))
 
-	res["buffer"]	  = buf
-	res["detection"]  = detection
-	res["confidence"] = confidence
+	res = {
+		"chunk_idx": chunk_idx,
+		"buffer": buf,
+		"megadetector_detection": results.get("megadetector_detection"),
+		"megadetector_conf": results.get("megadetector_conf", 0),
+		"tiger_detection": results.get("tiger_detection"),
+		"tiger_conf": results.get("tiger_conf", 0),
+		"florence_detection": results.get("florence_detection"),
+		"overall_detection": False,
+		"overall_confidence": 0
+	}
+    
+	# Number of models
+	total_models = 3
+    
+	# List of detection and confidence results
+	detections = [
+		results.get("megadetector_detection"),
+		results.get("tiger_detection"),
+		results.get("florence_detection")
+	]
+    
+	confidences = [
+		results.get("megadetector_conf", 0) if results.get("megadetector_detection") else 0,
+		results.get("tiger_conf", 0) if results.get("tiger_detection") else 0
+	]
+    
+	# Count the number of detections
+	detection_count = sum(detections)
+    
+	# Determine if the overall detection is successful (at least 2 models detected)
+	res["overall_detection"] = detection_count >= 2
+    
+	if res["overall_detection"]:
+		# Calculate the base confidence as the average of confidence scores from detecting models
+		if confidences:
+		    base_confidence = sum(confidences) / len(confidences)
+		else:
+		    base_confidence = 0
+	
+		# Adjust confidence based on models that did not detect
+		non_detection_count = total_models - detection_count
+		adjustment_factor = 1 - (non_detection_count / total_models)
+	
+		res["overall_confidence"] = base_confidence * adjustment_factor
+	else:
+		res["overall_confidence"] = 0  # No confidence if overall detection failed
 
 	chunk_idx+=1
 
@@ -327,7 +374,7 @@ def write_clip(clip, frame_chunk):
 		return
 
 
-	#print("Writing: [%d, %s]" %(frame_chunk["chunk_idx"], str(frame_chunk["detection"])))
+	#print("Writing: [%d, %s]" %(frame_chunk["chunk_idx"], str(frame_chunk["overall_detection"])))
 
 	most_recent_written_chunk = frame_chunk["chunk_idx"]
 	
@@ -359,24 +406,25 @@ def florence_task(image, task_prompt, text_input=None):
 	# Move input tensors to the GPU
 	input_ids = inputs["input_ids"].to(device)
 	pixel_values = inputs["pixel_values"].to(device)
-    
+   
 	generated_ids = florence_model.generate(
 		input_ids=input_ids,
 		pixel_values=pixel_values,
 		max_new_tokens=1024,
 		early_stopping=False,
 		do_sample=False,
-		num_beams=3,
+		num_beams=3,		
 	)
     
 	# Move generated_ids back to CPU before processing
 	generated_ids = generated_ids.to("cpu")
     
-	generated_text = florence_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+	generated_text = florence_processor.batch_decode(generated_ids, verbose=False, skip_special_tokens=False)[0]
+	
 	parsed_answer = florence_processor.post_process_generation(
 		generated_text,
 		task=task_prompt,
-		image_size=(image.width, image.height)
+		image_size=(image.width, image.height),
 	)
 
 	return parsed_answer
@@ -455,8 +503,8 @@ def process_chunk(pid, chunk, pu_lock, report_lock):
 			pbar.set_description("pid=%s Processing video %d/%d: %s" %(str(pid).zfill(2),fcnt+1,len(chunk),filename))
 
 		frame_chunk, success = get_video_chunk(invid, interval_frames, pu_lock)
-		if(frame_chunk["detection"] == True):
-			confidences.append(frame_chunk["confidence"])
+		if(frame_chunk["overall_detection"] == True):
+			confidences.append(frame_chunk["overall_confidence"])
 		
 		if(not args.nobar):	
 			pbar.update(interval_frames)
@@ -469,7 +517,7 @@ def process_chunk(pid, chunk, pu_lock, report_lock):
 				return
 
 			# state transition from SCANNING blanks to DETECTION
-			if(state == SCANNING and frame_chunk["detection"] == True):
+			if(state == SCANNING and frame_chunk["overall_detection"] == True):
 				#print("State transition from SCANNING blanks to DETECTION", flush=True)
 				state = DETECTION
 
@@ -499,7 +547,7 @@ def process_chunk(pid, chunk, pu_lock, report_lock):
 				write_clip(clip, frame_chunk)
 
 			# possible state transition from DETECTION back to SCANNING
-			elif(state == DETECTION and frame_chunk["detection"] == False):
+			elif(state == DETECTION and frame_chunk["overall_detection"] == False):
     
 				#print("state  == DETECTION, detection == False", flush=True)
 				#
@@ -514,16 +562,16 @@ def process_chunk(pid, chunk, pu_lock, report_lock):
 				# lets look into the future 2X to make sure we can split the clip
 				forward_buf = []
 				forward_buf.append(frame_chunk)
-				forward_detection_flag = frame_chunk["detection"]
+				forward_detection_flag = frame_chunk["overall_detection"]
 				for i in range(0,2*padding_intervals+1):   #SHENEMAN
 					frame_chunk, success = get_video_chunk(invid, interval_frames, pu_lock)
-					if(success and frame_chunk["detection"] == True):
-						confidences.append(frame_chunk["confidence"])
+					if(success and frame_chunk["overall_detection"] == True):
+						confidences.append(frame_chunk["overall_confidence"])
 					if(not args.nobar):
 						pbar.update(interval_frames)
 					if(success and frame_chunk["chunk_idx"]<=nchunks):
 						forward_buf.append(frame_chunk)
-						if(frame_chunk["detection"]):
+						if(frame_chunk["overall_detection"]):
 							forward_detection_flag = True
 				#	else:
 				#		print("ELSE: success and frame_chunk[0]<=nchunks")
@@ -625,7 +673,7 @@ def process_chunk(pid, chunk, pu_lock, report_lock):
 					#print("\n")
 
 
-			elif(state == DETECTION and frame_chunk["detection"] == True):
+			elif(state == DETECTION and frame_chunk["overall_detection"] == True):
 
 				if(len(buffer_chunks)>0):
 					#print("Flushing Primary Buffer...")		    
@@ -636,7 +684,7 @@ def process_chunk(pid, chunk, pu_lock, report_lock):
 				#print("state == DETECTION, and detection == TRUE", flush=True)
 				write_clip(clip, frame_chunk)
 	
-			else:   # state == SCANNING, frame_chunk["detection"] == FALSE
+			else:   # state == SCANNING, frame_chunk["overall_detection"] == FALSE
 				#print("state == SCANNING, detection == FALSE.  Continuing to see nothing....", flush=True) 
 
 				# add this new chunk to the sliding window
@@ -647,8 +695,8 @@ def process_chunk(pid, chunk, pu_lock, report_lock):
     
 		
 			frame_chunk, success = get_video_chunk(invid, interval_frames, pu_lock)
-			if(success and frame_chunk["detection"] == True):
-				confidences.append(frame_chunk["confidence"])
+			if(success and frame_chunk["overall_detection"] == True):
+				confidences.append(frame_chunk["overall_confidence"])
 			if(not args.nobar):
 				pbar.update(interval_frames)
 
@@ -656,8 +704,8 @@ def process_chunk(pid, chunk, pu_lock, report_lock):
 		try:
 			clip.release()
 			clip_end_frame = (most_recent_written_chunk * interval_frames) + interval_frames
-			with report_lock:
-				report(pid, [filename, clip_path, fps, clip_start_frame, clip_end_frame, confidences])
+			#with report_lock:
+			#	report(pid, [filename, clip_path, fps, clip_start_frame, clip_end_frame, confidences])
 		except:
 			None
 			 
